@@ -1,0 +1,10 @@
+rich>=13.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+beautifulsoup4>=4.12.0
+shodan>=1.30.0
+python-nmap>=0.7.1
+dnspython>=2.4.0
+python-whois>=0.8.0
+sublist3r>=1.0
+urllib3>=2.0.0
