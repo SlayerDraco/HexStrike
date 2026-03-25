@@ -1,137 +1,108 @@
 """
-HexStrike - Tool Availability Checker & Auto-Installer
-Checks for all required tools and installs missing ones automatically.
+HexStrike v2 - Tool Check Module
+Verifies and auto-installs all required system tools.
 """
 
 import subprocess
 import shutil
 import os
-import sys
-
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
 
-# Tools: (name, apt_package, pip_package or None, check_command)
 REQUIRED_TOOLS = [
-    ("nmap",        "nmap",               None,              ["nmap", "--version"]),
-    ("sqlmap",      "sqlmap",             None,              ["sqlmap", "--version"]),
-    ("hydra",       "hydra",              None,              ["hydra", "-h"]),
-    ("john",        "john",               None,              ["john", "--version"]),
-    ("wfuzz",       "wfuzz",              None,              ["wfuzz", "--version"]),
-    ("w3af",        None,                 None,              None),           # manual install note
-    ("metasploit",  "metasploit-framework", None,            ["msfconsole", "--version"]),
-    ("whois",       "whois",              None,              ["whois", "--version"]),
-    ("curl",        "curl",               None,              ["curl", "--version"]),
-    ("wget",        "wget",               None,              ["wget", "--version"]),
-    ("sublist3r",   None,                 "sublist3r",       ["sublist3r", "--help"]),
-    ("shodan",      None,                 "shodan",          ["shodan", "--version"]),
-    ("python-nmap", None,                 "python-nmap",     None),
-    ("requests",    None,                 "requests",        None),
-    ("bs4",         None,                 "beautifulsoup4",  None),
-    ("dnspython",   None,                 "dnspython",       None),
-    ("python-whois",None,                 "python-whois",    None),
+    # (display_name, apt_package, pip_package, binary_to_check)
+    ("nmap",             "nmap",                 None,                  "nmap"),
+    ("sqlmap",           "sqlmap",               None,                  "sqlmap"),
+    ("hydra",            "hydra",                None,                  "hydra"),
+    ("john",             "john",                 None,                  "john"),
+    ("wfuzz",            "wfuzz",                None,                  "wfuzz"),
+    ("metasploit",       "metasploit-framework", None,                  "msfconsole"),
+    ("whois",            "whois",                None,                  "whois"),
+    ("curl",             "curl",                 None,                  "curl"),
+    ("sublist3r",        None,                   "sublist3r",           "sublist3r"),
+    ("httpx (py)",       None,                   "httpx",               None),
+    ("requests",         None,                   "requests",            None),
+    ("beautifulsoup4",   None,                   "beautifulsoup4",      None),
+    ("dnspython",        None,                   "dnspython",           None),
+    ("python-whois",     None,                   "python-whois",        None),
+    ("shodan (py)",      None,                   "shodan",              None),
+    ("rich",             None,                   "rich",                None),
+    ("python-dotenv",    None,                   "python-dotenv",       None),
 ]
 
-def check_tool(tool_entry):
-    name, apt_pkg, pip_pkg, check_cmd = tool_entry
-    if check_cmd is None:
-        # Pure Python package — check via import or pip show
-        pkg = pip_pkg or name
-        result = subprocess.run(
-            ["pip3", "show", pkg],
-            capture_output=True, text=True
-        )
-        return result.returncode == 0
-    # Check if binary exists in PATH
-    return shutil.which(check_cmd[0]) is not None
 
-def install_tool(tool_entry):
-    name, apt_pkg, pip_pkg, check_cmd = tool_entry
+def _check(entry) -> bool:
+    name, apt, pip, binary = entry
+    if binary:
+        return shutil.which(binary) is not None
+    pkg = pip or name
+    r = subprocess.run(["pip3", "show", pkg], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def _install(entry) -> bool:
+    name, apt, pip, binary = entry
     try:
-        if pip_pkg:
-            console.print(f"  [cyan]→ pip3 install {pip_pkg}[/cyan]")
+        if pip:
             subprocess.run(
-                ["pip3", "install", pip_pkg, "--break-system-packages", "-q"],
-                check=True
+                ["pip3", "install", pip, "--break-system-packages", "-q"],
+                check=True, capture_output=True
             )
             return True
-        elif apt_pkg:
-            console.print(f"  [cyan]→ apt-get install -y {apt_pkg}[/cyan]")
+        if apt:
             subprocess.run(
-                ["apt-get", "install", "-y", "-q", apt_pkg],
-                check=True
+                ["apt-get", "install", "-y", "-q", apt],
+                check=True, capture_output=True
             )
             return True
-        else:
-            return False
     except subprocess.CalledProcessError:
-        return False
+        pass
+    return False
 
-def run_toolcheck():
+
+def run_toolcheck() -> dict:
     console.print()
     console.print(Panel(
-        "[bold yellow]Checking all required tools for HexStrike...[/bold yellow]",
-        border_style="yellow"
+        "[bold yellow]Verifying required tools...[/bold yellow]",
+        border_style="yellow", padding=(0, 2)
     ))
-    console.print()
 
-    results = []
-    missing = []
+    present, missing = [], []
+    for entry in REQUIRED_TOOLS:
+        (present if _check(entry) else missing).append(entry)
 
-    for tool_entry in REQUIRED_TOOLS:
-        name = tool_entry[0]
-        present = check_tool(tool_entry)
-        results.append((name, present, tool_entry))
-        if not present:
-            missing.append(tool_entry)
+    table = Table(box=box.SIMPLE_HEAVY, border_style="cyan", show_header=True)
+    table.add_column("Tool", style="bold white", width=18)
+    table.add_column("Status", width=14, justify="center")
+    table.add_column("Method", style="dim")
 
-    # Print status table
-    table = Table(title="Tool Status", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Tool", style="bold white")
-    table.add_column("Status", justify="center")
-    table.add_column("Install Method", style="dim")
-
-    for name, present, entry in results:
-        _, apt_pkg, pip_pkg, _ = entry
-        method = f"pip: {pip_pkg}" if pip_pkg else (f"apt: {apt_pkg}" if apt_pkg else "manual")
-        status = "[bold green]✔ Found[/bold green]" if present else "[bold red]✘ Missing[/bold red]"
+    for entry in REQUIRED_TOOLS:
+        name, apt, pip, _ = entry
+        ok = entry in present
+        method = f"pip:{pip}" if pip else (f"apt:{apt}" if apt else "system")
+        status = "[bold green]✔  found[/bold green]" if ok else "[bold red]✘  missing[/bold red]"
         table.add_row(name, status, method)
 
     console.print(table)
-    console.print()
 
     if not missing:
-        console.print("[bold green]✔ All tools are available. Ready to proceed.[/bold green]")
-        return
+        console.print("[bold green]✔ All tools available.[/bold green]\n")
+        return {"status": "ok", "missing": []}
 
-    console.print(f"[bold yellow]⚠ {len(missing)} tool(s) missing. Auto-installing...[/bold yellow]\n")
-
-    # Update apt cache first
-    console.print("[dim]Running apt-get update...[/dim]")
+    console.print(f"[yellow]Installing {len(missing)} missing tool(s)...[/yellow]")
     subprocess.run(["apt-get", "update", "-q"], capture_output=True)
 
     failed = []
-    for tool_entry in missing:
-        name = tool_entry[0]
-        console.print(f"[yellow]Installing: [bold]{name}[/bold][/yellow]")
-        success = install_tool(tool_entry)
-        if success:
-            console.print(f"  [green]✔ {name} installed successfully.[/green]")
+    for entry in missing:
+        name = entry[0]
+        if _install(entry):
+            console.print(f"  [green]✔ {name}[/green]")
         else:
-            if name == "w3af":
-                console.print(f"  [yellow]⚠ w3af requires manual installation: https://w3af.org/[/yellow]")
-            else:
-                console.print(f"  [red]✘ Failed to install {name}. Please install manually.[/red]")
-                failed.append(name)
+            console.print(f"  [red]✘ {name} — install manually[/red]")
+            failed.append(name)
 
-    console.print()
-    if failed:
-        console.print(f"[bold red]✘ Could not auto-install: {', '.join(failed)}[/bold red]")
-        console.print("[dim]Please install these manually before running affected modules.[/dim]")
-    else:
-        console.print("[bold green]✔ All available tools installed successfully.[/bold green]")
+    return {"status": "partial" if failed else "ok", "missing": failed}

@@ -1,476 +1,643 @@
 """
-HexStrike - Reconnaissance Module
-Step 1: Passive & Active Reconnaissance
-- WHOIS Lookup
-- Google Dorking (Google Custom Search API)
-- Nmap Fingerprinting
-- Shodan Scanning
-- Source Code Analysis
-- Subdomain Enumeration
+HexStrike v2 - Reconnaissance Module
+Builds the ScanGraph: subdomains → endpoints → parameters → technologies.
+All results are correlated, not dumped.
 """
 
-import os
-import sys
-import json
-import subprocess
-import socket
+from __future__ import annotations
+import asyncio
+import hashlib
 import re
+import socket
+import subprocess
 import time
-import threading
 from pathlib import Path
-from urllib.parse import urlparse
-from datetime import datetime
+from typing import List, Optional
+from urllib.parse import urlparse, urljoin, parse_qs, urlunparse
 
+import httpx
 import requests
+from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.rule import Rule
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
+from rich.table import Table
 from rich import box
+
+from core.models import (
+    ScanGraph, Subdomain, Endpoint, Parameter, Technology, Finding
+)
+from core.session import HexSession, AsyncHexSession
 
 console = Console()
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def extract_domain(target):
-    """Extract clean domain/IP from URL or raw input."""
-    if not target.startswith("http"):
-        target = "http://" + target
-    parsed = urlparse(target)
-    return parsed.hostname or target
-
-def extract_base_url(target):
+def _base_url(target: str) -> str:
     if not target.startswith("http"):
         return "http://" + target
     return target
 
-def run_live(cmd, label="Running"):
-    """Run a subprocess and stream output live to the terminal."""
-    console.print(f"\n[bold cyan]▶ {label}[/bold cyan]")
-    console.print(f"[dim]$ {' '.join(cmd)}[/dim]\n")
+def _domain(target: str) -> str:
+    return urlparse(_base_url(target)).hostname or target
+
+def _run_live(cmd: List[str], label: str = "") -> str:
+    console.print(f"\n[bold cyan]▶ {label or ' '.join(cmd[:2])}[/bold cyan]")
+    console.print(f"[dim]$ {' '.join(str(c) for c in cmd)}[/dim]")
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1
         )
-        output_lines = []
+        lines = []
         for line in proc.stdout:
             line = line.rstrip()
             if line:
                 console.print(f"  [white]{line}[/white]")
-                output_lines.append(line)
+                lines.append(line)
         proc.wait()
-        return "\n".join(output_lines)
+        return "\n".join(lines)
     except FileNotFoundError:
-        console.print(f"[red]✘ Command not found: {cmd[0]}[/red]")
-        return ""
-    except Exception as e:
-        console.print(f"[red]✘ Error: {e}[/red]")
+        console.print(f"[red]✘ Not found: {cmd[0]}[/red]")
         return ""
 
-# ─────────────────────────────────────────────
-# WHOIS
-# ─────────────────────────────────────────────
 
-def run_whois(domain):
-    console.print(Rule("[bold green]WHOIS Lookup[/bold green]"))
-    output = run_live(["whois", domain], label=f"WHOIS {domain}")
-    result = {"raw": output, "domain": domain}
+# ─── WHOIS ────────────────────────────────────────────────────────────────────
 
-    # Extract key fields
-    for line in output.splitlines():
+def _whois(domain: str) -> dict:
+    console.print(Rule("[bold green]WHOIS[/bold green]"))
+    raw = _run_live(["whois", domain], f"WHOIS {domain}")
+    result: dict = {"raw": raw, "domain": domain, "nameservers": []}
+    for line in raw.splitlines():
         ll = line.lower()
         if "registrar:" in ll:
             result["registrar"] = line.split(":", 1)[-1].strip()
-        elif "creation date:" in ll or "created:" in ll:
-            result["created"] = line.split(":", 1)[-1].strip()
-        elif "expiry date:" in ll or "expiration date:" in ll:
-            result["expires"] = line.split(":", 1)[-1].strip()
-        elif "name server:" in ll or "nserver:" in ll:
-            result.setdefault("nameservers", []).append(line.split(":", 1)[-1].strip())
-        elif "registrant" in ll and "email" in ll:
-            result["registrant_email"] = line.split(":", 1)[-1].strip()
+        elif any(x in ll for x in ["creation date:", "created:"]):
+            result.setdefault("created", line.split(":", 1)[-1].strip())
+        elif any(x in ll for x in ["expiry date:", "expiration date:"]):
+            result.setdefault("expires", line.split(":", 1)[-1].strip())
+        elif any(x in ll for x in ["name server:", "nserver:"]):
+            result["nameservers"].append(line.split(":", 1)[-1].strip())
         elif "org:" in ll or "organisation:" in ll:
-            result["org"] = line.split(":", 1)[-1].strip()
-
-    console.print(f"\n[green]✔ WHOIS complete.[/green]")
+            result.setdefault("org", line.split(":", 1)[-1].strip())
     return result
 
-# ─────────────────────────────────────────────
-# Google Dorking
-# ─────────────────────────────────────────────
 
-DORK_QUERIES = [
-    "site:{domain}",
-    "site:{domain} filetype:pdf",
-    "site:{domain} filetype:xml OR filetype:json OR filetype:sql",
-    "site:{domain} inurl:admin OR inurl:login OR inurl:dashboard",
-    "site:{domain} intitle:\"index of\"",
-    "site:{domain} intext:\"sql syntax\" OR intext:\"mysql error\"",
-    "site:{domain} inurl:config OR inurl:backup OR inurl:db",
-    "site:{domain} ext:env OR ext:log OR ext:bak",
-    "\"{domain}\" password OR credentials OR apikey",
-    "site:{domain} inurl:upload OR inurl:shell",
+# ─── Google Dorking ───────────────────────────────────────────────────────────
+
+DORKS = [
+    "site:{d}", "site:{d} filetype:pdf",
+    "site:{d} inurl:admin OR inurl:login", "site:{d} intitle:\"index of\"",
+    "site:{d} intext:\"sql syntax\" OR intext:\"mysql error\"",
+    "site:{d} ext:env OR ext:log OR ext:bak",
+    "\"{d}\" password OR apikey OR secret",
+    "site:{d} inurl:upload OR inurl:shell",
+    "site:{d} inurl:config OR inurl:backup",
 ]
 
-def run_google_dorking(domain, google_api_key, google_cx):
+def _google_dork(domain: str, api_key: str, cx: str) -> dict:
     console.print(Rule("[bold green]Google Dorking[/bold green]"))
-
-    if not google_api_key or not google_cx:
-        console.print("[yellow]⚠ Google API keys not configured. Skipping dorking.[/yellow]")
-        dork_list = [q.replace("{domain}", domain) for q in DORK_QUERIES]
-        console.print("[dim]Generated dork queries (run manually):[/dim]")
-        for d in dork_list:
-            console.print(f"  [cyan]{d}[/cyan]")
-        return {"skipped": True, "manual_dorks": dork_list}
-
+    if not api_key or not cx:
+        dorks = [d.replace("{d}", domain) for d in DORKS]
+        console.print("[yellow]⚠ No Google API keys. Manual dorks:[/yellow]")
+        for dork in dorks:
+            console.print(f"  [dim]{dork}[/dim]")
+        return {"skipped": True, "manual_dorks": dorks}
     results = {}
-    for query_template in DORK_QUERIES:
-        query = query_template.replace("{domain}", domain)
-        console.print(f"\n[cyan]Dorking:[/cyan] {query}")
+    for tmpl in DORKS:
+        q = tmpl.replace("{d}", domain)
         try:
-            resp = requests.get(
+            r = requests.get(
                 "https://www.googleapis.com/customsearch/v1",
-                params={"key": google_api_key, "cx": google_cx, "q": query, "num": 5},
+                params={"key": api_key, "cx": cx, "q": q, "num": 5},
                 timeout=10
             )
-            data = resp.json()
-            hits = []
-            for item in data.get("items", []):
-                hits.append({"title": item.get("title"), "link": item.get("link"), "snippet": item.get("snippet")})
+            items = r.json().get("items", [])
+            results[q] = [{"title": i.get("title"), "link": i.get("link")} for i in items]
+            for item in items:
                 console.print(f"  [white]→ {item.get('link')}[/white]")
-            results[query] = hits
-            time.sleep(1)  # Avoid rate limiting
+            time.sleep(0.5)
         except Exception as e:
-            console.print(f"  [red]Error: {e}[/red]")
-            results[query] = []
-
-    console.print(f"\n[green]✔ Google Dorking complete.[/green]")
+            results[q] = {"error": str(e)}
     return results
 
-# ─────────────────────────────────────────────
-# Nmap Fingerprinting
-# ─────────────────────────────────────────────
 
-def get_nmap_flags(intensity):
-    flags = {
-        "stealth": ["-sS", "-T2", "-O", "--version-light", "-sV", "--script=banner,http-headers"],
-        "normal":  ["-sS", "-T3", "-O", "-sV", "--script=banner,http-headers,http-title"],
-        "aggressive": ["-sS", "-T4", "-A", "-sV", "--script=banner,http-headers,http-title,vulners"],
-    }
-    return flags.get(intensity, flags["normal"])
+# ─── Nmap ─────────────────────────────────────────────────────────────────────
 
-def run_nmap(target, intensity, output_dir):
+def _nmap(target: str, flags: List[str], output_dir: str, graph: ScanGraph) -> dict:
     console.print(Rule("[bold green]Nmap Fingerprinting[/bold green]"))
-    domain = extract_domain(target)
-    out_file = str(Path(output_dir) / f"nmap_{domain.replace('.', '_')}.xml")
-    flags = get_nmap_flags(intensity)
-    cmd = ["nmap"] + flags + ["-oX", out_file, domain]
-    output = run_live(cmd, label=f"Nmap scan: {domain} [{intensity}]")
+    domain = _domain(target)
+    out_xml = str(Path(output_dir) / f"nmap_{domain.replace('.','_')}.xml")
+    cmd = ["nmap"] + flags + ["-oX", out_xml, domain]
+    raw = _run_live(cmd, f"Nmap → {domain}")
+    graph.raw_nmap = raw
 
-    # Parse key findings from output
-    findings = {
-        "target": domain,
-        "intensity": intensity,
-        "xml_output": out_file,
-        "open_ports": [],
-        "os_guess": None,
-        "services": [],
-        "raw": output
-    }
+    result = {"target": domain, "open_ports": [], "services": [], "os_guess": None}
+    for line in raw.splitlines():
+        m = re.search(r"(\d+)/tcp\s+open\s+(\S+)\s*(.*)", line)
+        if m:
+            port, svc, detail = m.group(1), m.group(2), m.group(3).strip()
+            result["open_ports"].append(port)
+            result["services"].append({"port": port, "service": svc, "detail": detail})
 
-    for line in output.splitlines():
-        # Open ports
-        port_match = re.search(r"(\d+)/tcp\s+open\s+(\S+)\s*(.*)", line)
-        if port_match:
-            findings["open_ports"].append(port_match.group(1))
-            findings["services"].append({
-                "port": port_match.group(1),
-                "service": port_match.group(2),
-                "detail": port_match.group(3).strip()
-            })
-        # OS detection
+            # Add tech to graph
+            tech_str = f"{svc} {detail}".lower()
+            ver_match = re.search(r"(\d+\.\d+[\.\d]*)", detail)
+            version = ver_match.group(1) if ver_match else None
+            graph.add_technology(Technology(name=svc, version=version, category="service"))
+
+            # Update root subdomain
+            sub = graph.get_subdomain(domain)
+            if sub:
+                sub.open_ports.append(int(port))
+                sub.services.append({"port": port, "service": svc, "detail": detail})
         if "OS details:" in line or "Running:" in line:
-            findings["os_guess"] = line.strip()
+            result["os_guess"] = line.strip()
+    return result
 
-    console.print(f"\n[green]✔ Nmap complete. Open ports: {', '.join(findings['open_ports']) or 'None found'}[/green]")
-    return findings
 
-# ─────────────────────────────────────────────
-# Shodan
-# ─────────────────────────────────────────────
+# ─── Shodan ───────────────────────────────────────────────────────────────────
 
-def run_shodan(domain, shodan_key):
-    console.print(Rule("[bold green]Shodan Scanning[/bold green]"))
-
-    if not shodan_key:
-        console.print("[yellow]⚠ SHODAN_API_KEY not configured. Skipping Shodan scan.[/yellow]")
+def _shodan(domain: str, key: str) -> dict:
+    console.print(Rule("[bold green]Shodan[/bold green]"))
+    if not key:
+        console.print("[yellow]⚠ SHODAN_API_KEY not set. Skipping.[/yellow]")
         return {"skipped": True}
-
     try:
         import shodan as shodan_lib
-        api = shodan_lib.Shodan(shodan_key)
-
-        # Resolve to IP
+        api = shodan_lib.Shodan(key)
         try:
             ip = socket.gethostbyname(domain)
         except Exception:
             ip = domain
-
-        console.print(f"[cyan]Querying Shodan for IP: {ip}[/cyan]")
         host = api.host(ip)
-
         result = {
-            "ip": ip,
-            "org": host.get("org"),
-            "country": host.get("country_name"),
-            "city": host.get("city"),
-            "isp": host.get("isp"),
-            "os": host.get("os"),
-            "ports": host.get("ports", []),
-            "vulns": list(host.get("vulns", [])),
-            "services": []
+            "ip": ip, "org": host.get("org"),
+            "country": host.get("country_name"), "isp": host.get("isp"),
+            "os": host.get("os"), "ports": host.get("ports", []),
+            "vulns": list(host.get("vulns", [])), "services": [],
         }
-
         for item in host.get("data", []):
-            svc = {
-                "port": item.get("port"),
-                "transport": item.get("transport"),
-                "product": item.get("product"),
-                "version": item.get("version"),
-                "banner": item.get("data", "")[:200],
-            }
+            svc = {"port": item.get("port"), "product": item.get("product"),
+                   "version": item.get("version"), "banner": item.get("data", "")[:200]}
             result["services"].append(svc)
-            console.print(f"  [white]Port {svc['port']}/{svc['transport']} — {svc['product']} {svc['version']}[/white]")
-
+            console.print(f"  [white]Port {svc['port']} — {svc['product']} {svc['version']}[/white]")
         if result["vulns"]:
-            console.print(f"\n  [bold red]⚠ Known CVEs: {', '.join(result['vulns'])}[/bold red]")
-
-        console.print(f"\n[green]✔ Shodan scan complete.[/green]")
+            console.print(f"  [bold red]CVEs: {', '.join(result['vulns'])}[/bold red]")
         return result
-
     except Exception as e:
-        console.print(f"[red]✘ Shodan error: {e}[/red]")
+        console.print(f"[red]✘ Shodan: {e}[/red]")
         return {"error": str(e)}
 
-# ─────────────────────────────────────────────
-# Source Code Analysis
-# ─────────────────────────────────────────────
+
+# ─── Tech Detection ───────────────────────────────────────────────────────────
+
+TECH_SIGNATURES = {
+    "WordPress":   [r"wp-content", r"wp-includes", r"/wp-json/"],
+    "Drupal":      [r"Drupal", r"/sites/default/", r'data-drupal'],
+    "Joomla":      [r"/components/com_", r"Joomla!"],
+    "Laravel":     [r"laravel_session", r"XSRF-TOKEN"],
+    "Django":      [r"csrfmiddlewaretoken", r"djdt"],
+    "React":       [r"__NEXT_DATA__", r"react-root", r'data-reactroot'],
+    "Angular":     [r"ng-version", r"ng-app"],
+    "Vue.js":      [r"__vue__", r"data-v-"],
+    "jQuery":      [r"jquery", r"jQuery"],
+    "Bootstrap":   [r"bootstrap.min.css", r"bootstrap.min.js"],
+    "PHP":         [r"\.php", r"PHPSESSID"],
+    "ASP.NET":     [r"__VIEWSTATE", r"\.aspx", r"ASP\.NET"],
+    "Express.js":  [r"X-Powered-By: Express"],
+    "Nginx":       [r"Server: nginx"],
+    "Apache":      [r"Server: Apache"],
+    "IIS":         [r"Server: Microsoft-IIS"],
+    "Cloudflare":  [r"CF-RAY", r"__cfduid"],
+    "GraphQL":     [r"/graphql", r'"__typename"', r"graphql"],
+    "Swagger":     [r"swagger-ui", r"/api-docs", r"openapi"],
+}
+
+def _detect_technologies(text: str, headers: dict) -> List[Technology]:
+    combined = text + " " + " ".join(f"{k}: {v}" for k, v in headers.items())
+    found = []
+    for name, patterns in TECH_SIGNATURES.items():
+        for pat in patterns:
+            if re.search(pat, combined, re.I):
+                # Try to extract version
+                ver_match = re.search(rf"{re.escape(name)}[/\s]+([\d.]+)", combined, re.I)
+                version = ver_match.group(1) if ver_match else None
+                found.append(Technology(name=name, version=version, category="web"))
+                break
+    return found
+
+
+# ─── Source Code Analysis ─────────────────────────────────────────────────────
 
 SECRET_PATTERNS = [
-    (r"(?i)(api[_\-]?key|apikey)\s*[:=]\s*['\"]?([A-Za-z0-9\-_]{16,})", "API Key"),
-    (r"(?i)(password|passwd|pwd)\s*[:=]\s*['\"]?([^\s'\"]{4,})", "Hardcoded Password"),
-    (r"(?i)(secret[_\-]?key|secret)\s*[:=]\s*['\"]?([A-Za-z0-9\-_]{8,})", "Secret Key"),
-    (r"(?i)(access[_\-]?token|auth[_\-]?token)\s*[:=]\s*['\"]?([A-Za-z0-9\-_.]{16,})", "Auth Token"),
-    (r"(?i)(aws[_\-]?access[_\-]?key|AKIA[0-9A-Z]{16})", "AWS Key"),
-    (r"(?i)(db[_\-]?password|database[_\-]?pass)\s*[:=]\s*['\"]?([^\s'\"]{4,})", "DB Password"),
-    (r"<!--.*?-->", "HTML Comment"),
-    (r"(?i)todo[:\s]+(.*)", "TODO Comment"),
-    (r"(?i)fixme[:\s]+(.*)", "FIXME Comment"),
-    (r"(?i)(error|exception|stacktrace|traceback)[:\s]+(.*)", "Error Message"),
+    (r'(?i)(api[_\-]?key|apikey)\s*[:=]\s*[\'"]?([A-Za-z0-9\-_]{16,})', "API Key"),
+    (r'(?i)(password|passwd|pwd)\s*[:=]\s*[\'"]?([^\s\'"]{4,})',         "Password"),
+    (r'(?i)(secret[_\-]?key|secret)\s*[:=]\s*[\'"]?([A-Za-z0-9\-_]{8,})','Secret Key'),
+    (r'(?i)(access[_\-]?token|auth[_\-]?token)\s*[:=]\s*[\'"]?([A-Za-z0-9\-_.]{16,})', "Token"),
+    (r'AKIA[0-9A-Z]{16}',                                                 "AWS Key"),
+    (r'(?i)(db[_\-]?password)\s*[:=]\s*[\'"]?([^\s\'"]{4,})',            "DB Password"),
+    (r'<!--.*?-->',                                                        "HTML Comment"),
 ]
 
-def run_source_analysis(target):
-    console.print(Rule("[bold green]Source Code Analysis[/bold green]"))
-    base_url = extract_base_url(target)
-    findings = {"url": base_url, "secrets": [], "comments": [], "forms": [], "links": [], "has_login": False}
-
-    console.print(f"[cyan]Fetching: {base_url}[/cyan]")
-
+def _analyze_source(url: str, session: HexSession, graph: ScanGraph) -> Endpoint:
+    ep = Endpoint(url=url, method="GET")
     try:
-        from bs4 import BeautifulSoup
-        headers = {"User-Agent": "Mozilla/5.0 (HexStrike Scanner)"}
-        resp = requests.get(base_url, headers=headers, timeout=15, verify=False)
+        resp = session.get(url)
+        ep.status_code = resp.status_code
+        ep.content_type = resp.headers.get("content-type", "")
+        ep.headers = dict(resp.headers)
+        ep.authenticated = session.is_authenticated
+
         html = resp.text
+        ep.response_hash = hashlib.md5(html.encode()).hexdigest()
 
-        # Regex scan for secrets
-        for pattern, label in SECRET_PATTERNS:
-            for match in re.finditer(pattern, html):
-                snippet = match.group(0)[:120]
-                if label not in ["HTML Comment", "TODO Comment", "FIXME Comment", "Error Message"]:
-                    console.print(f"  [bold red]🔑 {label}:[/bold red] [white]{snippet}[/white]")
-                    findings["secrets"].append({"type": label, "snippet": snippet})
-                else:
-                    findings["comments"].append({"type": label, "snippet": snippet})
+        # Detect technologies
+        techs = _detect_technologies(html, dict(resp.headers))
+        ep.technologies = techs
+        for t in techs:
+            graph.add_technology(t)
+            if t.name == "GraphQL":
+                graph.graphql_detected = True
 
-        # Parse HTML
         soup = BeautifulSoup(html, "html.parser")
 
-        # Forms
+        # Parse forms
         for form in soup.find_all("form"):
-            action = form.get("action", "")
+            action = form.get("action") or url
+            if not action.startswith("http"):
+                action = urljoin(url, action)
             method = form.get("method", "GET").upper()
-            inputs = [i.get("name", "") for i in form.find_all("input")]
-            findings["forms"].append({"action": action, "method": method, "inputs": inputs})
-            console.print(f"  [cyan]Form:[/cyan] {method} → {action} | inputs: {inputs}")
-            if any(k in str(inputs).lower() for k in ["password", "passwd", "pass", "pwd"]):
-                findings["has_login"] = True
+            inputs = []
+            for inp in form.find_all(["input", "textarea", "select"]):
+                name = inp.get("name", "")
+                val  = inp.get("value", "")
+                if name:
+                    inputs.append({"name": name, "value": val, "type": inp.get("type", "text")})
+                    p = Parameter(name=name, value=val, param_type="body", endpoint=action)
+                    ep.add_parameter(p)
+            ep.forms.append({"action": action, "method": method, "inputs": inputs})
+            if any(k in str(inputs).lower() for k in ["password", "passwd", "pass"]):
+                ep.is_admin = False  # login, not admin
+                console.print(f"  [cyan]Login form:[/cyan] {method} → {action}")
+
+        # Parse URL parameters
+        parsed = urlparse(url)
+        for k, vals in parse_qs(parsed.query).items():
+            p = Parameter(name=k, value=vals[0] if vals else "", param_type="query", endpoint=url)
+            ep.add_parameter(p)
 
         # Links
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href and not href.startswith("#"):
-                findings["links"].append(href)
+        links = []
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"]
+            if href.startswith("http"):
+                links.append(href)
+            elif href.startswith("/"):
+                base = f"{parsed.scheme}://{parsed.netloc}"
+                links.append(base + href)
 
-        # Check for login indicators
-        login_keywords = ["login", "signin", "sign-in", "auth", "password", "username", "email"]
-        if any(kw in html.lower() for kw in login_keywords):
-            findings["has_login"] = True
+        # Secrets
+        for pat, label in SECRET_PATTERNS:
+            for m in re.finditer(pat, html, re.DOTALL):
+                snippet = m.group(0)[:120]
+                ep.notes.append(f"SECRET:{label}:{snippet}")
+                console.print(f"  [bold red]🔑 {label}:[/bold red] {snippet[:80]}")
 
-        console.print(f"\n  Found {len(findings['forms'])} form(s), {len(findings['secrets'])} secret(s), login page: {'Yes' if findings['has_login'] else 'No'}")
-        console.print(f"[green]✔ Source analysis complete.[/green]")
+        # Admin detection
+        if any(k in url.lower() for k in ["admin", "dashboard", "cpanel", "wp-admin"]):
+            ep.is_admin = True
 
-    except requests.exceptions.SSLError:
-        console.print("[yellow]⚠ SSL verification failed. Retrying without verification...[/yellow]")
-        try:
-            import urllib3
-            urllib3.disable_warnings()
-            resp = requests.get(base_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15, verify=False)
-            findings["raw_length"] = len(resp.text)
-        except Exception as e:
-            console.print(f"[red]✘ Failed: {e}[/red]")
+        # API detection
+        if any(k in url.lower() for k in ["/api/", "/v1/", "/v2/", "/graphql", "/rest/"]):
+            ep.is_api = True
+
+        console.print(
+            f"  [green]✔[/green] {url} — "
+            f"[white]{ep.status_code}[/white]  "
+            f"forms:{len(ep.forms)}  params:{len(ep.parameters)}  "
+            f"techs:{','.join(t.name for t in ep.technologies) or 'none'}"
+        )
+
     except Exception as e:
-        console.print(f"[red]✘ Error during source analysis: {e}[/red]")
+        console.print(f"  [red]✘ {url}: {e}[/red]")
 
-    return findings
+    return ep
 
-# ─────────────────────────────────────────────
-# Subdomain Enumeration
-# ─────────────────────────────────────────────
 
-def run_subdomain_enum(domain, wordlist_path, output_dir, intensity):
-    console.print(Rule("[bold green]Subdomain Enumeration[/bold green]"))
-    found_subs = []
+# ─── Subdomain Enumeration ────────────────────────────────────────────────────
 
-    # Method 1: Sublist3r
-    console.print("[cyan]Running Sublist3r...[/cyan]")
-    sub_out = str(Path(output_dir) / f"subdomains_{domain.replace('.', '_')}.txt")
-    output = run_live(
-        ["sublist3r", "-d", domain, "-o", sub_out, "-t", "10"],
-        label=f"Sublist3r: {domain}"
-    )
+async def _resolve_sub(sub: str, sem: asyncio.Semaphore) -> tuple[str, Optional[str]]:
+    async with sem:
+        try:
+            loop = asyncio.get_event_loop()
+            ip = await loop.run_in_executor(None, socket.gethostbyname, sub)
+            return sub, ip
+        except Exception:
+            return sub, None
 
-    if Path(sub_out).exists():
-        with open(sub_out) as f:
-            found_subs = [line.strip() for line in f if line.strip()]
-
-    # Method 2: Brute-force from wordlist
-    console.print(f"\n[cyan]Brute-forcing subdomains from wordlist ({wordlist_path})...[/cyan]")
+async def _enum_subs_async(domain: str, wordlist: str, concurrency: int) -> List[tuple]:
+    """Brute-force subdomains asynchronously."""
     try:
-        with open(wordlist_path, "r") as f:
-            words = [line.strip() for line in f if line.strip()][:2000]  # Limit for speed
-
-        console.print(f"[dim]Testing {len(words)} subdomain prefixes...[/dim]")
-        for word in words:
-            sub = f"{word}.{domain}"
-            try:
-                socket.setdefaulttimeout(1)
-                ip = socket.gethostbyname(sub)
-                if sub not in found_subs:
-                    found_subs.append(sub)
-                    console.print(f"  [green]✔ Found:[/green] [white]{sub}[/white] → {ip}")
-            except (socket.gaierror, socket.timeout):
-                pass
+        with open(wordlist) as f:
+            words = [l.strip() for l in f if l.strip()][:3000]
     except FileNotFoundError:
-        console.print(f"[yellow]⚠ Wordlist not found: {wordlist_path}[/yellow]")
+        return []
+    subs = [f"{w}.{domain}" for w in words]
+    sem = asyncio.Semaphore(concurrency)
+    tasks = [_resolve_sub(s, sem) for s in subs]
+    results = await asyncio.gather(*tasks)
+    return [(sub, ip) for sub, ip in results if ip]
 
-    # Deduplicate
-    found_subs = list(set(found_subs))
-    console.print(f"\n[green]✔ Subdomain enum complete. Found {len(found_subs)} subdomain(s).[/green]")
-    return found_subs
+def _subdomain_enum(domain: str, wordlist: str, output_dir: str, profile) -> List[Subdomain]:
+    console.print(Rule("[bold green]Subdomain Enumeration[/bold green]"))
+    found: dict[str, str] = {}
 
-# ─────────────────────────────────────────────
-# Pentest Surface Check
-# ─────────────────────────────────────────────
+    # Sublist3r
+    out_file = str(Path(output_dir) / f"subs_{domain.replace('.','_')}.txt")
+    _run_live(["sublist3r", "-d", domain, "-o", out_file, "-t", "10"],
+              f"Sublist3r → {domain}")
+    if Path(out_file).exists():
+        for line in Path(out_file).read_text().splitlines():
+            sub = line.strip()
+            if sub:
+                try:
+                    ip = socket.gethostbyname(sub)
+                    found[sub] = ip
+                    console.print(f"  [green]✔[/green] {sub} → {ip}")
+                except Exception:
+                    pass
 
-def check_pentest_surface(source_results, nmap_results, subdomains):
-    """Determine if there's anything meaningful to pentest."""
-    has_forms = len(source_results.get("forms", [])) > 0
-    has_login = source_results.get("has_login", False)
-    has_open_ports = len(nmap_results.get("open_ports", [])) > 0
-    has_subdomains = len(subdomains) > 0
-    has_secrets = len(source_results.get("secrets", [])) > 0
+    # Async brute-force
+    console.print(f"\n[cyan]Async brute-force ({wordlist})...[/cyan]")
+    loop = asyncio.new_event_loop()
+    new_subs = loop.run_until_complete(
+        _enum_subs_async(domain, wordlist, profile.concurrency)
+    )
+    loop.close()
+    for sub, ip in new_subs:
+        if sub not in found:
+            found[sub] = ip
+            console.print(f"  [green]✔[/green] {sub} → {ip}")
 
-    surface = {
-        "has_forms": has_forms,
-        "has_login": has_login,
-        "has_open_ports": has_open_ports,
-        "has_subdomains": has_subdomains,
-        "has_secrets": has_secrets,
-        "has_anything": any([has_forms, has_login, has_open_ports, has_secrets]),
-    }
-    return surface
+    result = []
+    for fqdn, ip in found.items():
+        s = Subdomain(fqdn=fqdn, ip=ip, alive=True)
+        result.append(s)
 
-# ─────────────────────────────────────────────
-# Main Recon Runner
-# ─────────────────────────────────────────────
+    console.print(f"\n[green]✔ Found {len(result)} subdomain(s).[/green]")
+    return result
 
-def run_recon(config):
+
+# ─── Crawler ──────────────────────────────────────────────────────────────────
+
+async def _crawl_async(
+    start_url: str, session: HexSession, graph: ScanGraph,
+    depth: int, max_urls: int
+):
+    """Async BFS crawler. Builds endpoint list for the graph."""
+    visited = set()
+    queue = [(start_url, 0)]
+    parsed_base = urlparse(start_url)
+    base_domain = parsed_base.netloc
+
+    async_sess = AsyncHexSession(session)
+
+    async with async_sess.build() as client:
+        while queue and len(visited) < max_urls:
+            url, lvl = queue.pop(0)
+            if url in visited or lvl > depth:
+                continue
+            visited.add(url)
+
+            try:
+                resp = await client.get(url)
+                ep = Endpoint(
+                    url=url, method="GET",
+                    status_code=resp.status_code,
+                    content_type=resp.headers.get("content-type", ""),
+                    headers=dict(resp.headers),
+                    authenticated=session.is_authenticated,
+                )
+                ep.response_hash = hashlib.md5(resp.text.encode()).hexdigest()
+
+                # Parse params from URL
+                for k, vals in parse_qs(urlparse(url).query).items():
+                    ep.add_parameter(Parameter(
+                        name=k, value=vals[0] if vals else "",
+                        param_type="query", endpoint=url
+                    ))
+
+                # Admin/API flags
+                ep.is_admin = any(k in url.lower() for k in ["admin","dashboard","cpanel","wp-admin"])
+                ep.is_api   = any(k in url.lower() for k in ["/api/","/v1/","/v2/","/graphql","/rest/"])
+
+                if resp.status_code < 400:
+                    graph.add_root_endpoint(ep)
+                    if lvl < depth:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        for tag in soup.find_all("a", href=True):
+                            href = tag["href"]
+                            if href.startswith("/"):
+                                href = f"{parsed_base.scheme}://{base_domain}{href}"
+                            if href.startswith("http") and base_domain in href:
+                                if href not in visited:
+                                    queue.append((href, lvl + 1))
+            except Exception:
+                pass
+
+    console.print(f"  [green]✔ Crawled {len(visited)} URL(s).[/green]")
+
+
+# ─── API / Swagger / GraphQL ──────────────────────────────────────────────────
+
+SWAGGER_PATHS = [
+    "/swagger-ui.html", "/api-docs", "/swagger.json", "/openapi.json",
+    "/v2/api-docs", "/v3/api-docs", "/api/swagger", "/docs",
+    "/api/docs", "/.well-known/openapi.yaml",
+]
+GRAPHQL_PATHS = ["/graphql", "/gql", "/graphql/v1", "/api/graphql"]
+
+def _check_api_spec(base_url: str, session: HexSession, graph: ScanGraph):
+    console.print(Rule("[bold green]API / Swagger / GraphQL Detection[/bold green]"))
+
+    for path in SWAGGER_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            resp = session.get(url)
+            if resp.status_code == 200 and len(resp.text) > 100:
+                console.print(f"  [bold green]✔ Swagger/OpenAPI found:[/bold green] {url}")
+                try:
+                    import json
+                    spec = resp.json()
+                    graph.api_spec = spec
+                    # Extract paths from spec
+                    paths = spec.get("paths", {})
+                    for api_path, methods in paths.items():
+                        for method in methods.keys():
+                            ep_url = base_url.rstrip("/") + api_path
+                            ep = Endpoint(url=ep_url, method=method.upper(), is_api=True)
+                            # Extract parameters
+                            params = methods[method].get("parameters", [])
+                            for param in params:
+                                p = Parameter(
+                                    name=param.get("name", ""),
+                                    param_type=param.get("in", "query"),
+                                    endpoint=ep_url
+                                )
+                                ep.add_parameter(p)
+                            graph.add_root_endpoint(ep)
+                    console.print(f"  [cyan]  Extracted {len(paths)} API path(s) from spec.[/cyan]")
+                except Exception:
+                    graph.api_spec = {"raw_url": url, "content": resp.text[:500]}
+                break
+        except Exception:
+            pass
+
+    for path in GRAPHQL_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            # Introspection query
+            resp = session.post(url, json={"query": "{__schema{types{name}}}"})
+            if resp.status_code == 200 and "__schema" in resp.text:
+                console.print(f"  [bold green]✔ GraphQL endpoint found:[/bold green] {url}")
+                graph.graphql_detected = True
+                ep = Endpoint(url=url, method="POST", is_api=True)
+                graph.add_root_endpoint(ep)
+                break
+        except Exception:
+            pass
+
+    if not graph.api_spec and not graph.graphql_detected:
+        console.print("  [dim]No Swagger/OpenAPI/GraphQL spec detected.[/dim]")
+
+
+# ─── Real-Time Intelligence ───────────────────────────────────────────────────
+
+INTELLIGENCE_RULES = [
+    (r"apache[/ ]2\.[0-2]",    "Outdated Apache — check CVE-2017-7679, CVE-2017-9798"),
+    (r"php/[45]\.",             "Outdated PHP — multiple known RCE CVEs"),
+    (r"openssl/1\.0",           "Outdated OpenSSL — POODLE/Heartbleed potential"),
+    (r"nginx/1\.[0-9]\.",       "Check nginx version for known vulns"),
+    (r"microsoft-iis/[67]\.",   "Old IIS — check CVE-2017-7269"),
+    (r"wp-login\.php",          "WordPress login — XML-RPC brute force applicable"),
+    (r"drupal",                 "Drupal detected — check Drupalgeddon2"),
+    (r"joomla",                 "Joomla detected — check CVE-2015-8562"),
+    (r"struts",                 "Apache Struts — check CVE-2017-5638 (Equifax)"),
+]
+
+def _print_intelligence(graph: ScanGraph):
+    console.print(Rule("[bold yellow]⚡ Real-Time Scan Intelligence[/bold yellow]"))
+    flagged = []
+    full_text = graph.raw_nmap.lower()
+    for sub in graph.subdomains:
+        for svc in sub.services:
+            full_text += f" {svc.get('service','')} {svc.get('detail','')}".lower()
+    for tech in graph.technologies:
+        full_text += f" {tech.name}/{tech.version or ''}".lower()
+
+    for pattern, message in INTELLIGENCE_RULES:
+        if re.search(pattern, full_text, re.I):
+            console.print(f"  [bold yellow][!][/bold yellow] {message}")
+            flagged.append(message)
+
+    if not flagged:
+        console.print("  [dim]No obvious outdated tech detected.[/dim]")
+    return flagged
+
+
+# ─── Main Recon Runner ────────────────────────────────────────────────────────
+
+def run_recon(graph: ScanGraph, session: HexSession, config: dict, profile) -> ScanGraph:
     import config as cfg
 
-    targets = config["targets"]
-    intensity = config["intensity"]
+    target = config["targets"][0]  # Primary target
+    domain = _domain(target)
+    base_url = _base_url(target)
     output_dir = config["output_dir"]
-    wordlist = config["wordlist"]
 
-    all_results = {}
+    console.print()
+    console.print(Panel(
+        f"[bold white]Target:[/bold white] [bold cyan]{target}[/bold cyan]\n"
+        f"[bold white]Profile:[/bold white] [bold yellow]{profile.name}[/bold yellow]  "
+        f"[bold white]Intensity:[/bold white] {profile.intensity}",
+        title="[bold yellow]RECONNAISSANCE[/bold yellow]",
+        border_style="yellow"
+    ))
 
-    for target in targets:
-        console.print()
+    # 1. Create root subdomain node
+    root_sub = Subdomain(fqdn=domain, alive=True)
+    try:
+        root_sub.ip = socket.gethostbyname(domain)
+    except Exception:
+        pass
+    graph.add_subdomain(root_sub)
+
+    # 2. WHOIS
+    graph.whois = _whois(domain)
+
+    # 3. Google Dorking
+    graph.dork_results = _google_dork(domain, cfg.GOOGLE_API_KEY, cfg.GOOGLE_CX)
+
+    # 4. Nmap
+    nmap_result = _nmap(target, profile.nmap_flags, output_dir, graph)
+
+    # 5. Shodan
+    graph.shodan = _shodan(domain, cfg.SHODAN_API_KEY)
+
+    # 6. Subdomain enumeration
+    subs = _subdomain_enum(domain, config["wordlist"], output_dir, profile)
+    for sub in subs:
+        graph.add_subdomain(sub)
+
+    # 7. Source analysis on root
+    console.print(Rule("[bold green]Source Code Analysis[/bold green]"))
+    root_ep = _analyze_source(base_url, session, graph)
+    graph.add_root_endpoint(root_ep)
+
+    # 8. Async crawl
+    console.print(Rule("[bold green]Crawling[/bold green]"))
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(
+        _crawl_async(base_url, session, graph, profile.crawl_depth, profile.max_urls)
+    )
+    loop.close()
+
+    # 9. API / Swagger / GraphQL detection
+    _check_api_spec(base_url, session, graph)
+
+    # 10. Scan each alive subdomain's root
+    if subs:
+        console.print(Rule("[bold green]Subdomain Surface Analysis[/bold green]"))
+        for sub in subs[:10]:  # Cap to 10 to avoid excessive scanning
+            sub_url = f"http://{sub.fqdn}"
+            ep = _analyze_source(sub_url, session, graph)
+            sub.add_endpoint(ep)
+
+    # 11. Real-time intelligence
+    intelligence = _print_intelligence(graph)
+    graph.metadata["intelligence"] = intelligence
+
+    # 12. Surface summary
+    summary = graph.summary()
+    console.print()
+    console.print(Panel(
+        f"[bold]Subdomains:[/bold]  {summary['subdomains_found']}\n"
+        f"[bold]Endpoints:[/bold]   {summary['endpoints_found']}\n"
+        f"[bold]Parameters:[/bold]  {summary['parameters_found']}\n"
+        f"[bold]API endpoints:[/bold] {summary['api_endpoints']}\n"
+        f"[bold]Technologies:[/bold] {', '.join(summary['technologies']) or 'none'}",
+        title="[bold green]RECON COMPLETE[/bold green]",
+        border_style="green"
+    ))
+
+    if summary["endpoints_found"] == 0 and not nmap_result["open_ports"]:
         console.print(Panel(
-            f"[bold white]Target:[/bold white] [bold cyan]{target}[/bold cyan]",
-            title="[bold yellow]RECONNAISSANCE[/bold yellow]",
+            "[bold yellow]⚠ No significant attack surface found on this target.[/bold yellow]\n"
+            "No open ports, no reachable endpoints, no parameters discovered.",
+            title="[yellow]LOW ATTACK SURFACE[/yellow]",
             border_style="yellow"
         ))
 
-        domain = extract_domain(target)
-        result = {"target": target, "domain": domain}
-
-        # WHOIS
-        result["whois"] = run_whois(domain)
-
-        # Google Dorking
-        result["dorking"] = run_google_dorking(domain, cfg.GOOGLE_API_KEY, cfg.GOOGLE_CX)
-
-        # Nmap
-        result["nmap"] = run_nmap(target, intensity, output_dir)
-
-        # Shodan
-        result["shodan"] = run_shodan(domain, cfg.SHODAN_API_KEY)
-
-        # Source Code Analysis
-        result["source"] = run_source_analysis(target)
-
-        # Subdomain Enumeration
-        result["subdomains"] = run_subdomain_enum(domain, wordlist, output_dir, intensity)
-
-        # Surface check
-        surface = check_pentest_surface(result["source"], result["nmap"], result["subdomains"])
-        result["surface"] = surface
-
-        if not surface["has_anything"]:
-            console.print(Panel(
-                "[bold yellow]⚠ Nothing significant found to pentest on this target.[/bold yellow]\n"
-                "[white]No open ports, no forms, no login pages, and no exposed secrets were detected.\n"
-                "This target may not have exploitable attack surface.[/white]",
-                title="[yellow]LOW ATTACK SURFACE[/yellow]",
-                border_style="yellow"
-            ))
-        else:
-            console.print(Panel(
-                f"[green]✔ Attack surface identified![/green]\n"
-                f"  Login page: {'Yes' if surface['has_login'] else 'No'}\n"
-                f"  Forms: {'Yes' if surface['has_forms'] else 'No'}\n"
-                f"  Open ports: {'Yes' if surface['has_open_ports'] else 'No'}\n"
-                f"  Hardcoded secrets: {'Yes' if surface['has_secrets'] else 'No'}\n"
-                f"  Subdomains: {'Yes' if surface['has_subdomains'] else 'No'}",
-                title="[green]ATTACK SURFACE SUMMARY[/green]",
-                border_style="green"
-            ))
-
-        all_results[target] = result
-
-    return all_results
+    return graph

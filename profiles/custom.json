@@ -1,0 +1,18 @@
+{
+  "name": "custom",
+  "description": "User-defined custom profile. Edit as needed.",
+  "intensity": "normal",
+  "concurrency": 10,
+  "timeout": 15,
+  "delay": 0.2,
+  "modules": ["toolcheck", "recon", "exploit"],
+  "nmap_flags": ["-sS", "-T3", "-sV", "--script=banner,http-headers"],
+  "crawl_depth": 2,
+  "max_urls": 80,
+  "fuzz_params": true,
+  "run_msf": false,
+  "run_bruteforce": true,
+  "run_idor": true,
+  "run_api": true,
+  "run_biz_logic": false
+}
