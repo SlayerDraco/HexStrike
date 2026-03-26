@@ -163,8 +163,6 @@ hexstrike_v2/
     └── subdomains.txt        # 160-entry bundled subdomain list
 ```
 
-**Total: 19 Python files · 4,747 lines · all syntax-verified**
-
 ---
 
 ## Requirements
