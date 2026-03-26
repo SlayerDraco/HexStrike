@@ -71,7 +71,7 @@ Key design principles:
 
 Version 2 is a ground-up rewrite. The original single-file modules have been replaced with a proper layered architecture.
 
-| Feature | v1.x | v2.0.0 |
+| Feature | v1.0.0 | v2.0.0 |
 |---|---|---|
 | Data model | Dict dumps per module | Correlated `ScanGraph` with typed dataclasses |
 | HTTP client | `requests` (sync) | `httpx` (async + sync), session-aware |
